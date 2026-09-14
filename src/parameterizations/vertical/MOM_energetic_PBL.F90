@@ -54,6 +54,16 @@ type, public :: energetic_PBL_CS ; private
                              !! buoyancy production minus the vertically integrated dissipation of
                              !! TKE produced by buoyancy.
 
+  !/ Integrated ePBL+MLE coupling
+  logical :: MLE_coupling    !< If true, subtract the submesoscale (MLE) restratification buoyancy
+                             !! flux (passed in via visc%MLE_Buoy_Flux, and computed by
+                             !! MOM_mixed_layer_restrat) from the mechanically generated TKE
+                             !! available to ePBL, so that the diagnosed boundary layer depth
+                             !! accounts for submesoscale restratification, following the
+                             !! integrated ePBL+MLE framework of Sane et al. (in prep). This is the
+                             !! ePBL-side switch of the two-way coupling; see also
+                             !! MLE_COUPLE_TO_EPBL in MOM_mixed_layer_restrat.
+
   !/ Mixing Length terms
   logical :: Use_MLD_iteration !< If true, use the proximity to the bottom of the actively turbulent
                              !! surface boundary layer to constrain the mixing lengths.
@@ -268,6 +278,7 @@ type, public :: energetic_PBL_CS ; private
   integer :: id_ML_depth = -1, id_hML_depth = -1, id_TKE_wind = -1, id_TKE_mixing = -1
   integer :: id_ustar_ePBL = -1, id_bflx_ePBL = -1
   integer :: id_TKE_MKE = -1, id_TKE_conv = -1, id_TKE_forcing = -1
+  integer :: id_TKE_MLE = -1
   integer :: id_TKE_mech_decay = -1, id_TKE_conv_decay = -1
   integer :: id_Mixing_Length = -1, id_Velocity_Scale = -1
   integer :: id_Kd_BBL = -1, id_BBL_Mix_Length = -1, id_BBL_Vel_Scale = -1
@@ -481,7 +492,9 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
     diag_mstar_LT, &   ! mstar due to Langmuir turbulence [nondim]
     diag_LA, &         ! Langmuir number [nondim]
     diag_LA_mod, &     ! Modified Langmuir number [nondim]
-    diag_ustar         ! The surface boundary layer friction velocity [Z T-1 ~> m s-1]
+    diag_ustar, &      ! The surface boundary layer friction velocity [Z T-1 ~> m s-1]
+    diag_TKE_MLE       ! The submesoscale (MLE) restratification sink applied to the mechanical
+                       ! TKE when CS%MLE_coupling is true [R Z3 T-3 ~> W m-2]
 
   ! The following variables are only used for diagnosing sensitivities to ePBL settings
   real, dimension(SZK_(GV)+1) :: &
@@ -671,6 +684,17 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
           absf = sqrt(CS%omega_frac*4.0*CS%omega**2 + (1.0-CS%omega_frac)*absf**2)
       endif
 
+      ! Diagnose the submesoscale (MLE) restratification-induced TKE sink, following the
+      ! integrated ePBL+MLE framework (see the accompanying manuscript). visc%MLE_Buoy_Flux is
+      ! computed by MOM_mixed_layer_restrat, lagged by one call of that routine because ePBL and
+      ! MLE restratification occur at different points in the split time-stepping, and is only
+      ! associated if at least one of the two ePBL+MLE coupling switches is enabled. This is
+      ! passed into ePBL_column as MLE_TKE_sink and applied there, *after* mstar scaling, so
+      ! that it is subtracted directly as in the manuscript rather than being scaled by mstar.
+      diag_TKE_MLE(i,j) = 0.0
+      if (CS%MLE_coupling .and. associated(visc%MLE_Buoy_Flux)) &
+        diag_TKE_MLE(i,j) = GV%Rho0 * visc%MLE_Buoy_Flux(i,j)
+
       ! Perhaps provide a first guess for MLD based on a stored previous value.
       MLD_io = -1.0
       if (CS%MLD_iteration_guess .and. (CS%ML_depth(i,j) > 0.0))  MLD_io = CS%ML_depth(i,j)
@@ -688,11 +712,12 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
         call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
                          u_star, u_star_mean, mech_TKE, dt, MLD_io, Kd, mixvel, mixlen, GV, &
                          US, CS, eCD, Waves, G, i, j, &
-                         TKE_gen_stoch=stoch_CS%epbl1_wts(i,j), TKE_diss_stoch=stoch_CS%epbl2_wts(i,j))
+                         TKE_gen_stoch=stoch_CS%epbl1_wts(i,j), TKE_diss_stoch=stoch_CS%epbl2_wts(i,j), &
+                         MLE_TKE_sink=dt*diag_TKE_MLE(i,j))
       else
         call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
                          u_star, u_star_mean, mech_TKE, dt, MLD_io, Kd, mixvel, mixlen, GV, &
-                         US, CS, eCD, Waves, G, i, j)
+                         US, CS, eCD, Waves, G, i, j, MLE_TKE_sink=dt*diag_TKE_MLE(i,j))
       endif
       if (CS%id_Kd_ePBL_col_by_col > 0) &
         call post_data_3d_by_column(CS%id_Kd_ePBL_col_by_col, Kd, CS%diag, i, j)
@@ -851,6 +876,7 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
   if (CS%id_TKE_wind > 0) call post_data(CS%id_TKE_wind, diag_TKE_wind, CS%diag)
   if (CS%id_TKE_MKE > 0)  call post_data(CS%id_TKE_MKE, diag_TKE_MKE, CS%diag)
   if (CS%id_TKE_conv > 0) call post_data(CS%id_TKE_conv, diag_TKE_conv, CS%diag)
+  if (CS%id_TKE_MLE > 0)  call post_data(CS%id_TKE_MLE, diag_TKE_MLE, CS%diag)
   if (CS%id_TKE_forcing > 0) call post_data(CS%id_TKE_forcing, diag_TKE_forcing, CS%diag)
   if (CS%id_TKE_mixing > 0) call post_data(CS%id_TKE_mixing, diag_TKE_mixing, CS%diag)
   if (CS%id_TKE_mech_decay > 0) &
@@ -895,7 +921,7 @@ end subroutine energetic_PBL
 !!  mixed layer model for a single column of water.
 subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing, B_flux, absf, &
                        u_star, u_star_mean, mech_TKE_in, dt, MLD_io, Kd, mixvel, mixlen, GV, US, CS, eCD, &
-                       Waves, G, i, j, TKE_gen_stoch, TKE_diss_stoch)
+                       Waves, G, i, j, TKE_gen_stoch, TKE_diss_stoch, MLE_TKE_sink)
   type(verticalGrid_type), intent(in)    :: GV     !< The ocean's vertical grid structure.
   type(unit_scale_type),   intent(in)    :: US     !< A dimensional unit scaling type
   real, dimension(SZK_(GV)), intent(in)  :: h      !< Layer thicknesses [H ~> m or kg m-2].
@@ -951,6 +977,10 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   integer,                 intent(in)    :: j      !< The j-index to work on (used for Waves)
   real,          optional, intent(in)    :: TKE_gen_stoch  !< random factor used to perturb TKE generation [nondim]
   real,          optional, intent(in)    :: TKE_diss_stoch !< random factor used to perturb TKE dissipation [nondim]
+  real,          optional, intent(in)    :: MLE_TKE_sink !< The submesoscale (MLE) restratification
+                                                   !! TKE sink to apply after mstar scaling, following
+                                                   !! the integrated ePBL+MLE framework. Only applied
+                                                   !! if CS%MLE_coupling is true [R Z3 T-2 ~> J m-2].
 
 !    This subroutine determines the diffusivities in a single column from the integrated energetics
 !  planetary boundary layer (ePBL) model.  It assumes that heating, cooling and freshwater fluxes
@@ -1269,6 +1299,11 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
     endif
     ! stochastically perturb mech_TKE in the UFS
     if (present(TKE_gen_stoch)) mech_TKE = mech_TKE*TKE_gen_stoch
+
+    ! Subtract the submesoscale (MLE) restratification TKE sink after mstar scaling, so that it
+    ! is removed directly from the mstar-scaled mechanical TKE as in the integrated ePBL+MLE
+    ! framework, rather than being scaled down by mstar itself.
+    if (present(MLE_TKE_sink)) mech_TKE = max(mech_TKE - MLE_TKE_sink, 0.0)
 
     if (CS%TKE_diagnostics) then
       eCD%dTKE_conv = 0.0 ; eCD%dTKE_mixing = 0.0
@@ -3960,6 +3995,19 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
                  "due to reduction of stable density gradient.", &
                  units="nondim", default=0.0)
 
+!/ Integrated ePBL+MLE coupling
+  call get_param(param_file, mdl, "EPBL_MLE_COUPLING", CS%MLE_coupling, &
+                 "If true, subtract the submesoscale (MLE) restratification buoyancy flux "//&
+                 "(computed by MOM_mixed_layer_restrat) from the mechanically generated TKE "//&
+                 "available to ePBL, so that the diagnosed boundary layer depth accounts for "//&
+                 "submesoscale restratification, following the integrated ePBL+MLE framework "//&
+                 "of Sane et al. (in prep). This is the ePBL-side switch of the two-way "//&
+                 "coupling; the restrat-side switch is MLE_COUPLE_TO_EPBL in the MLE "//&
+                 "parameter block. Setting both switches true enables the full two-way "//&
+                 "coupling, this switch alone enables only the ePBL-side changes, and "//&
+                 "MLE_COUPLE_TO_EPBL alone enables only the restrat-side changes.", &
+                 default=.false.)
+
 !/ Mixing Length Options
   call get_param(param_file, mdl, "USE_MLD_ITERATION", CS%Use_MLD_iteration, &
                  "A logical that specifies whether or not to use the "//&
@@ -4355,6 +4403,9 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
       Time, 'Mean kinetic energy source of mixed layer TKE', units='W m-2', conversion=US%RZ3_T3_to_W_m2)
   CS%id_TKE_conv = register_diag_field('ocean_model', 'ePBL_TKE_conv', diag%axesT1, &
       Time, 'Convective source of mixed layer TKE', units='W m-2', conversion=US%RZ3_T3_to_W_m2)
+  CS%id_TKE_MLE = register_diag_field('ocean_model', 'ePBL_TKE_MLE', diag%axesT1, &
+      Time, 'Submesoscale (MLE) restratification sink of mixed layer mechanical TKE, applied '//&
+            'when EPBL_MLE_COUPLING is true', units='W m-2', conversion=US%RZ3_T3_to_W_m2)
   CS%id_TKE_forcing = register_diag_field('ocean_model', 'ePBL_TKE_forcing', diag%axesT1, &
       Time, 'TKE consumed by mixing surface forcing or penetrative shortwave radation '//&
             'through model layers', units='W m-2', conversion=US%RZ3_T3_to_W_m2)

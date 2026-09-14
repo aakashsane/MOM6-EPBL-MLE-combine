@@ -71,6 +71,16 @@ type, public :: mixedlayer_restrat_CS ; private
 
   ! The following parameters are used in the Bodner et al., 2023, parameterization
   logical :: use_Bodner = .false.  !< If true, use the Bodner et al., 2023, parameterization.
+  logical :: MLE_couple_to_ePBL = .false. !< If true, use the ePBL active boundary-layer depth to
+                                   !! modify the MLE streamfunction shape function (mu_hat instead
+                                   !! of mu) so as to avoid double counting restratification with
+                                   !! the ePBL TKE budget. This is the "restrat-side" switch of the
+                                   !! integrated ePBL+MLE two-way coupling; see also
+                                   !! EPBL_MLE_COUPLING in MOM_energetic_PBL. Independently of this
+                                   !! switch, the MLE restratification buoyancy flux diagnostic used
+                                   !! by MOM_energetic_PBL is computed and passed on whenever the
+                                   !! MLE_Buoy_Flux field is allocated (i.e. whenever either
+                                   !! coupling switch is enabled).
   real    :: Cr                    !< Efficiency coefficient from Bodner et al., 2023 [nondim]
   real    :: mstar                 !< The m* value used to estimate the turbulent vertical momentum flux [nondim]
   real    :: nstar                 !< The n* value used to estimate the turbulent vertical momentum flux [nondim]
@@ -148,7 +158,8 @@ contains
 !> Driver for the mixed-layer restratification parameterization.
 !! The code branches between two different implementations depending
 !! on whether the bulk-mixed layer or a general coordinate are in use.
-subroutine mixedlayer_restrat(h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux, VarMix, G, GV, US, CS)
+subroutine mixedlayer_restrat(h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux, MLE_Buoy_Flux, &
+                               VarMix, G, GV, US, CS)
   type(ocean_grid_type),                      intent(inout) :: G      !< Ocean grid structure
   type(verticalGrid_type),                    intent(in)    :: GV     !< Ocean vertical grid structure
   type(unit_scale_type),                      intent(in)    :: US     !< A dimensional unit scaling type
@@ -167,6 +178,12 @@ subroutine mixedlayer_restrat(h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux, 
                                                                       !! scheme [H ~> m or kg m-2]
   real, dimension(:,:),                       pointer       :: bflux  !< Surface buoyancy flux provided by the
                                                                       !! PBL scheme [Z2 T-3 ~> m2 s-3]
+  real, dimension(:,:),                       pointer       :: MLE_Buoy_Flux !< Output: the MLE
+                                                                      !! restratification buoyancy flux integrated
+                                                                      !! over the ePBL active boundary layer, for
+                                                                      !! use in the ePBL TKE budget, following the
+                                                                      !! integrated ePBL+MLE framework
+                                                                      !! [Z3 T-3 ~> m3 s-3]. Only used if associated.
   type(VarMix_CS),                            intent(in)    :: VarMix !< Variable mixing control structure
   type(mixedlayer_restrat_CS),                intent(inout) :: CS     !< Module control structure
 
@@ -179,7 +196,8 @@ subroutine mixedlayer_restrat(h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux, 
     call mixedlayer_restrat_BML(h, uhtr, vhtr, tv, forces, dt, G, GV, US, CS)
   elseif (CS%use_Bodner) then
     ! Implementation of Bodner et al., 2023
-    call mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux)
+    call mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, dt, MLD, h_MLD, bflux, &
+                                    MLE_Buoy_Flux)
   else
     ! Implementation of Fox-Kemper et al., 2008, to work in general coordinates
     call mixedlayer_restrat_OM4(h, uhtr, vhtr, tv, forces, dt, h_MLD, VarMix, G, GV, US, CS)
@@ -752,9 +770,53 @@ real function mu(sigma, dh)
   mu = max(mu, dd*bottop)  ! Combines original psi1 with tail
 end function mu
 
+!> Modified MLE stream-function shape, \f$\hat\mu(z)\f$, that avoids double counting
+!! submesoscale restratification with the vertical mixing energy budget used by ePBL.
+!!
+!! Within the active boundary layer (as measured by the ratio of the ePBL depth to the
+!! mixed-layer depth, sigma_bl), the standard cubic-tailed mu(z) is replaced by a linear
+!! profile that vanishes at the surface and matches mu(z) at the base of the boundary
+!! layer.  This is because, once the ePBL boundary-layer TKE budget includes the MLE
+!! restratification flux directly (see the integrated ePBL+MLE framework), the portion of
+!! the streamfunction within -H_bl <= z <= 0 is already accounted for through the boundary
+!! layer's energetics, and only needs to smoothly carry the remaining transport down to the
+!! base of the boundary layer. Below the boundary layer (out to the mixed-layer base), the
+!! streamfunction is unmodified, mu_hat = mu. If the boundary layer is at least as deep as
+!! the mixed layer, all of the restratification is already captured by the boundary-layer
+!! TKE budget, so the residual streamfunction is switched off entirely.
+real function mu_hat(sigma, sigma_bl, dh)
+  real, intent(in) :: sigma    !< Fractional position within the mixed layer [nondim].
+                               !! z=0 is the surface, z=-1 is the bottom of the mixed layer.
+  real, intent(in) :: sigma_bl !< Ratio of the ePBL active boundary-layer depth to the mixed-layer
+                               !! depth, H_bl/H_ml [nondim], defined to be non-negative.
+  real, intent(in) :: dh       !< Non-dimensional distance over which to extend stream
+                               !! function to smooth transport at base [nondim], passed to mu().
+  ! Local variables
+  real :: mu_at_bld ! The value of the unmodified mu(z) at the base of the boundary layer [nondim]
+
+  if (sigma_bl >= 1.0) then
+    ! The boundary layer reaches at least as deep as the mixed layer, so the ePBL+MLE
+    ! integrated TKE budget already accounts for all of the restratification; see row 3 of
+    ! Table 1 in the manuscript.
+    mu_hat = 0.0
+  elseif (sigma_bl <= 0.0) then
+    ! No active boundary layer to speak of: fall back on the unmodified structure function.
+    mu_hat = mu(sigma, dh)
+  elseif (sigma >= -sigma_bl) then
+    ! Within the active boundary layer: linear profile matching mu(z) at z=-H_bl (row 1 of Table 1).
+    mu_at_bld = mu(-sigma_bl, dh)
+    mu_hat = mu_at_bld * (sigma / (-sigma_bl))
+  else
+    ! Between the base of the boundary layer and the base of the mixed layer: unmodified
+    ! MLE structure function (row 2 of Table 1).
+    mu_hat = mu(sigma, dh)
+  endif
+end function mu_hat
+
 !> Calculates a restratifying flow in the mixed layer, following the formulation
 !! used in Bodner et al., 2023 (B22)
-subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, dt, BLD, h_MLD, bflux)
+subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, dt, BLD, h_MLD, bflux, &
+                                      MLE_Buoy_Flux)
   ! Arguments
   type(mixedlayer_restrat_CS),                intent(inout) :: CS     !< Module control structure
   type(ocean_grid_type),                      intent(inout) :: G      !< Ocean grid structure
@@ -775,6 +837,13 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
                                                                       !! the PBL scheme [H ~> m or kg m-2]
   real, dimension(:,:),                       pointer       :: bflux  !< Surface buoyancy flux provided by the
                                                                       !! PBL scheme [Z2 T-3 ~> m2 s-3]
+  real, dimension(:,:),                       pointer       :: MLE_Buoy_Flux !< Output: the MLE
+                                                                      !! restratification buoyancy flux integrated
+                                                                      !! over the ePBL active boundary layer,
+                                                                      !! expressed as an equivalent turbulent
+                                                                      !! velocity cubed, for use in the ePBL TKE
+                                                                      !! budget [Z3 T-3 ~> m3 s-3]. Only computed
+                                                                      !! if associated.
   ! Local variables
   real :: uhml(SZIB_(G),SZJ_(G),SZK_(GV)) ! zonal mixed layer transport [H L2 T-1 ~> m3 s-1 or kg s-1]
   real :: vhml(SZI_(G),SZJB_(G),SZK_(GV)) ! merid mixed layer transport [H L2 T-1 ~> m3 s-1 or kg s-1]
@@ -790,6 +859,10 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
     wpup                  ! Turbulent vertical momentum [L H T-2 ~> m2 s-2 or kg m-1 s-2]
   real :: uDml_diag(SZIB_(G),SZJ_(G))  ! A 2D copy of uDml for diagnostics [H L2 T-1 ~> m3 s-1 or kg s-1]
   real :: vDml_diag(SZI_(G),SZJB_(G))  ! A 2D copy of vDml for diagnostics [H L2 T-1 ~> m3 s-1 or kg s-1]
+  real :: mle_wb_u(SZIB_(G),SZJ_(G))   ! MLE restratification buoyancy flux integrated over the ePBL
+                          ! active boundary layer, at u-points, expressed as an equivalent velocity
+                          ! cubed [Z3 T-3 ~> m3 s-3]. Only computed if MLE_Buoy_Flux is associated.
+  real :: mle_wb_v(SZI_(G),SZJB_(G))   ! As for mle_wb_u but at v-points [Z3 T-3 ~> m3 s-3]
   real :: lf_bodner_diag(SZI_(G),SZJ_(G)) ! Front width as in Bodner et al., 2023 (B22), eq 24 [L ~> m]
   real :: U_star_2d(SZI_(G),SZJ_(G))   ! The wind friction velocity, calculated using the Boussinesq
                           ! reference density or the time-evolving surface density in non-Boussinesq
@@ -817,13 +890,19 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   real :: h_big           ! "Big H", the mixed layer depth based on a time filtered "little h" [H ~> m or kg m-2]
   real :: grd_b           ! The vertically average gradient of buoyancy [L H-1 T-2 ~> s-2 or m3 kg-1 s-2]
   real :: psi_mag         ! Magnitude of stream function [L2 H T-1 ~> m3 s-1 or kg s-1]
+  real :: wb_flux         ! MLE restratification buoyancy flux density implied by psi_mag at a
+                          ! velocity point, before depth integration [L2 T-3 ~> m2 s-3]
+  real :: mu_int_bl       ! The sigma-space integral of the (unmodified) mu(z) structure function
+                          ! from the surface to the base of the ePBL active boundary layer [nondim]
   real :: h_neglect       ! tiny thickness usually lost in roundoff so can be neglected [H ~> m or kg m-2]
   real :: I4dt            ! 1/(4 dt) [T-1 ~> s-1]
   real :: Ihtot           ! Inverses of the total mixed layer thickness [H-1 ~> m-1 or m2 kg-1]
   real :: hAtVel          ! Thickness at the velocity points [H ~> m or kg m-2]
   real :: sigint          ! Fractional position within the mixed layer of the interface above a layer [nondim]
-  real :: muzb            ! mu(z) at bottom of the layer [nondim]
-  real :: muza            ! mu(z) at top of the layer [nondim]
+  real :: muzb            ! mu_hat(z) at bottom of the layer [nondim]
+  real :: muza            ! mu_hat(z) at top of the layer [nondim]
+  real :: sigma_bl        ! Ratio of the ePBL active boundary-layer depth to the mixed-layer
+                          ! depth, H_bl/H_ml, at a velocity point [nondim]
   real :: dh              ! Portion of the layer thickness that is in the mixed layer [H ~> m or kg m-2]
   real :: Z3_T3_to_m3_s3  ! Conversion factors to undo scaling and permit terms to be raised to a
                           ! fractional power [T3 m3 Z-3 s-3 ~> 1]
@@ -998,7 +1077,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   !$OMP default(shared) &
   !$OMP private(i, j, k, keep_going, line_is_empty, dh, &
   !$OMP   grid_dsd, absf, h_sml, h_big, grd_b, r_wpup, psi_mag, IhTot, &
-  !$OMP   sigint, muzb, muza, hAtVel, Rml_int, SpV_int)
+  !$OMP   sigint, muzb, muza, sigma_bl, hAtVel, Rml_int, SpV_int, wb_flux, mu_int_bl)
 
   !$OMP do
   do j=js-1,je+1
@@ -1066,21 +1145,48 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       h_big = 0.5*( big_H(i,j) + big_H(i+1,j) )                       ! [H ~> m or kg m-2]
       grd_b = ( buoy_av(i+1,j) - buoy_av(i,j) ) * G%IdxCu(I,j)        ! [L H-1 T-2 ~> s-2 or m3 kg-1 s-2]
       r_wpup = 2. / ( wpup(i,j) + wpup(i+1,j) )                       ! [T2 L-1 H-1 ~> s2 m-2 or m s2 kg-1]
+      ! wpup includes mstar maybe
       psi_mag = ( ( ( (0.5*(CS%Cr_space(i,j) + CS%Cr_space(i+1,j))) * grid_dsd ) & ! [L2 H T-1 ~> m3 s-1 or kg s-1]
                   * ( absf * h_sml ) ) * ( ( h_big**2 ) * grd_b ) ) * r_wpup
     else  ! There is no flux on land and no gradient at open boundary points.
-      psi_mag = 0.0
+      psi_mag = 0.0 ; h_sml = 0.0 ; h_big = 0.0 ; grd_b = 0.0
+    endif
+
+    ! Ratio of the ePBL active boundary-layer depth to the mixed-layer depth at this velocity
+    ! point, used by mu_hat() to avoid double-counting restratification already captured by
+    ! the boundary-layer TKE budget (see Table 1 in the manuscript).
+    sigma_bl = h_sml / (h_big + h_neglect)
+
+    if (associated(MLE_Buoy_Flux)) then
+      ! Diagnose the MLE restratification buoyancy flux implied by the (unmodified, pre-CFL-limited)
+      ! bolus transport, then integrate it over the ePBL active boundary layer using the unmodified
+      ! mu(z) structure function, following the integrated ePBL+MLE framework. This is computed
+      ! regardless of CS%MLE_couple_to_ePBL so that the ePBL-side coupling can be tested on its own.
+      wb_flux = psi_mag * grd_b * G%IdyCu(I,j)  ! APE release rate density [L2 T-3 ~> m2 s-3]
+      if (sigma_bl >= 1.0) then
+        mu_int_bl = 44.0/63.0 ! Sigma-space integral of the full mu(z) profile [nondim]
+      else
+        mu_int_bl = 0.5 * sigma_bl * mu(-sigma_bl, CS%MLE_tail_dh)
+      endif
+      ! Depth-integrate and convert to an equivalent turbulent velocity cubed [Z3 T-3 ~> m3 s-3]
+      mle_wb_u(I,j) = (US%L_to_Z**2) * wb_flux * mu_int_bl * (GV%H_to_Z * h_big)
+    else
+      mle_wb_u(I,j) = 0.0
     endif
 
     IhTot = 2.0 / ((htot(i,j) + htot(i+1,j)) + h_neglect) ! [H-1 ~> m-1 or m2 kg-1]
     sigint = 0.0
-    muzb = 0.0 ! This will be the first value of muza = mu(z=0)
+    muzb = 0.0 ! This will be the first value of muza = mu_hat(z=0)
     do k=1,nz
-      muza = muzb                           ! mu(z/MLD) for upper interface [nondim]
+      muza = muzb                           ! mu_hat(z/MLD) for upper interface [nondim]
       hAtVel = 0.5*(h(i,j,k) + h(i+1,j,k))  ! Thickness at velocity point [H ~> m or kg m-2]
       sigint = sigint - (hAtVel * IhTot)    ! z/H for lower interface [nondim]
-      muzb = mu(sigint, CS%MLE_tail_dh)     ! mu(z/MLD) for lower interface [nondim]
-      dmu(k) = muza - muzb                  ! Change in mu(z) across layer [nondim]
+      if (CS%MLE_couple_to_ePBL) then
+        muzb = mu_hat(sigint, sigma_bl, CS%MLE_tail_dh) ! mu_hat(z/MLD) for lower interface [nondim]
+      else
+        muzb = mu(sigint, CS%MLE_tail_dh)     ! mu(z/MLD) for lower interface [nondim]
+      endif
+      dmu(k) = muza - muzb                  ! Change in mu_hat(z) across layer [nondim]
       ! dmu(k)*psi_mag is the transport in this layer [L2 H T-1 ~> m3 s-1]
       ! Limit magnitude (psi_mag) if it would violate CFL
       if (dmu(k)*psi_mag > 0.0) then
@@ -1110,18 +1216,40 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
       psi_mag = ( ( ( (0.5*(CS%Cr_space(i,j) + CS%Cr_space(i,j+1))) * grid_dsd ) & ! [L2 H T-1 ~> m3 s-1 or kg s-1]
                   * ( absf * h_sml ) ) * ( ( h_big**2 ) * grd_b ) ) * r_wpup
     else  ! There is no flux on land and no gradient at open boundary points.
-      psi_mag = 0.0
+      psi_mag = 0.0 ; h_sml = 0.0 ; h_big = 0.0 ; grd_b = 0.0
+    endif
+
+    ! Ratio of the ePBL active boundary-layer depth to the mixed-layer depth at this velocity
+    ! point, used by mu_hat() to avoid double-counting restratification already captured by
+    ! the boundary-layer TKE budget (see Table 1 in the manuscript).
+    sigma_bl = h_sml / (h_big + h_neglect)
+
+    if (associated(MLE_Buoy_Flux)) then
+      ! See the analogous computation in the U-component loop above for a full explanation.
+      wb_flux = psi_mag * grd_b * G%IdxCv(i,J)  ! APE release rate density [L2 T-3 ~> m2 s-3]
+      if (sigma_bl >= 1.0) then
+        mu_int_bl = 44.0/63.0 ! Sigma-space integral of the full mu(z) profile [nondim]
+      else
+        mu_int_bl = 0.5 * sigma_bl * mu(-sigma_bl, CS%MLE_tail_dh)
+      endif
+      mle_wb_v(i,J) = (US%L_to_Z**2) * wb_flux * mu_int_bl * (GV%H_to_Z * h_big)
+    else
+      mle_wb_v(i,J) = 0.0
     endif
 
     IhTot = 2.0 / ((htot(i,j) + htot(i,j+1)) + h_neglect) ! [H-1 ~> m-1 or m2 kg-1]
     sigint = 0.0
-    muzb = 0.0 ! This will be the first value of muza = mu(z=0)
+    muzb = 0.0 ! This will be the first value of muza = mu_hat(z=0)
     do k=1,nz
-      muza = muzb                           ! mu(z/MLD) for upper interface [nondim]
+      muza = muzb                           ! mu_hat(z/MLD) for upper interface [nondim]
       hAtVel = 0.5*(h(i,j,k) + h(i,j+1,k))  ! Thickness at velocity point [H ~> m or kg m-2]
       sigint = sigint - (hAtVel * IhTot)    ! z/H for lower interface [nondim]
-      muzb = mu(sigint, CS%MLE_tail_dh)     ! mu(z/MLD) for lower interface [nondim]
-      dmu(k) = muza - muzb                  ! Change in mu(z) across layer [nondim]
+      if (CS%MLE_couple_to_ePBL) then
+        muzb = mu_hat(sigint, sigma_bl, CS%MLE_tail_dh) ! mu_hat(z/MLD) for lower interface [nondim]
+      else
+        muzb = mu(sigint, CS%MLE_tail_dh)     ! mu(z/MLD) for lower interface [nondim]
+      endif
+      dmu(k) = muza - muzb                  ! Change in mu_hat(z) across layer [nondim]
       ! dmu(k)*psi_mag is the transport in this layer [L2 H T-1 ~> m3 s-1 or kg s-1]
       ! Limit magnitude (psi_mag) if it would violate CFL
       if (dmu(k)*psi_mag > 0.0) then
@@ -1144,6 +1272,14 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
         ((uhml(I,j,k) - uhml(I-1,j,k)) + (vhml(i,J,k) - vhml(i,J-1,k)))
   enddo ; enddo ; enddo
   !$OMP end parallel
+
+  if (associated(MLE_Buoy_Flux)) then
+    ! Average the face-point MLE buoyancy flux diagnostics onto tracer points for use by ePBL.
+    do j=js,je ; do i=is,ie
+      MLE_Buoy_Flux(i,j) = 0.25 * ( (mle_wb_u(I-1,j) + mle_wb_u(I,j)) + &
+                                     (mle_wb_v(i,J-1) + mle_wb_v(i,J)) )
+    enddo ; enddo
+  endif
 
   if (CS%id_uhml > 0 .or. CS%id_vhml > 0) &
     ! Remapped uhml and vhml require east/north halo updates of h
@@ -1681,6 +1817,15 @@ logical function mixedlayer_restrat_init(Time, G, GV, US, param_file, diag, CS, 
              default=.false.)
   endif
   if (CS%use_Bodner) then
+    call get_param(param_file, mdl, "MLE_COUPLE_TO_EPBL", CS%MLE_couple_to_ePBL, &
+             "If true, modify the MLE streamfunction shape function using the ePBL active "//&
+             "boundary-layer depth so as to avoid double counting restratification with the "//&
+             "ePBL TKE budget, following the integrated ePBL+MLE framework of Sane et al. "//&
+             "(in prep). This is the restrat-side switch of the two-way ePBL+MLE coupling; "//&
+             "the ePBL-side switch is EPBL_MLE_COUPLING in the ENERGETIC_PBL parameter block. "//&
+             "Setting both switches true enables the full two-way coupling, this switch alone "//&
+             "enables only the restrat-side changes, and EPBL_MLE_COUPLING alone enables only "//&
+             "the ePBL-side changes.", default=.false.)
     call get_param(param_file, mdl, "CR", CS%Cr, &
              "The efficiency coefficient in eq 27 of Bodner et al., 2023.", &
              units="nondim", default=0.0)

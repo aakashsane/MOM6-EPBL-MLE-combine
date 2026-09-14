@@ -2778,6 +2778,7 @@ subroutine set_visc_register_restarts(HI, G, GV, US, param_file, visc, restart_C
   logical :: adiabatic, useKPP, useEPBL, use_ideal_age
   logical :: do_brine_plume, use_hor_bnd_diff, use_neutral_diffusion, use_fpmix
   logical :: use_CVMix_shear, MLE_use_PBL_MLD, MLE_use_Bodner, use_CVMix_conv
+  logical :: MLE_couple_to_ePBL, EPBL_MLE_coupling
   integer :: isd, ied, jsd, jed, nz
   real :: hfreeze !< If hfreeze > 0 [Z ~> m], melt potential will be computed.
   character(len=16)  :: Kv_units, Kd_units
@@ -2864,7 +2865,11 @@ subroutine set_visc_register_restarts(HI, G, GV, US, param_file, visc, restart_C
   call openParameterBlock(param_file, 'MLE', do_not_log=.true.)
     call get_param(param_file, mdl, "USE_BODNER23", MLE_use_Bodner, &
                  default=.false., do_not_log=.true.)
+    call get_param(param_file, mdl, "MLE_COUPLE_TO_EPBL", MLE_couple_to_ePBL, &
+                 default=.false., do_not_log=.true.)
   call closeParameterBlock(param_file)
+  call get_param(param_file, mdl, "EPBL_MLE_COUPLING", EPBL_MLE_coupling, &
+                 default=.false., do_not_log=.true.)
 
   if (MLE_use_PBL_MLD .or. MLE_use_Bodner) then
     call safe_alloc_ptr(visc%MLD, isd, ied, jsd, jed)
@@ -2891,6 +2896,18 @@ subroutine set_visc_register_restarts(HI, G, GV, US, param_file, visc, restart_C
     call register_restart_field(visc%sfc_buoy_flx, "SFC_BFLX", .false., restart_CS, &
                                 "Instantaneous surface buoyancy flux", "m2 s-3", &
                                 conversion=US%Z_to_m**2*US%s_to_T**3)
+  endif
+
+  ! visc%MLE_Buoy_Flux is used to communicate the MLE restratification buoyancy flux from
+  ! MOM_mixed_layer_restrat into the ePBL TKE budget in MOM_energetic_PBL, following the
+  ! integrated ePBL+MLE framework. It is only allocated if at least one of the two coupling
+  ! switches is enabled, so that the default (both switches off) is unaffected.
+  if (MLE_use_Bodner .and. (MLE_couple_to_ePBL .or. EPBL_MLE_coupling)) then
+    call safe_alloc_ptr(visc%MLE_Buoy_Flux, isd, ied, jsd, jed)
+    call register_restart_field(visc%MLE_Buoy_Flux, "MLE_BUOY_FLUX", .false., restart_CS, &
+                                "MLE restratification buoyancy flux integrated over the ePBL "//&
+                                "boundary layer, expressed as an equivalent velocity cubed", &
+                                "m3 s-3", conversion=US%Z_to_m**3*US%s_to_T**3)
   endif
 
   if (use_ice_shelf) then

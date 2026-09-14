@@ -295,6 +295,13 @@ type, public :: vertvisc_type
   real, pointer, dimension(:,:) :: MLD => NULL()  !< Instantaneous active mixing layer depth [Z ~> m].
   real, pointer, dimension(:,:) :: h_ML => NULL() !< Instantaneous active mixing layer thickness [H ~> m or kg m-2].
   real, pointer, dimension(:,:) :: sfc_buoy_flx => NULL() !< Surface buoyancy flux (derived) [Z2 T-3 ~> m2 s-3].
+  real, pointer, dimension(:,:) :: MLE_Buoy_Flux => NULL() !< The submesoscale (MLE) restratification
+                !! buoyancy flux integrated over the ePBL active boundary layer depth, expressed
+                !! as an equivalent turbulent velocity cubed for direct comparison with u_star**3
+                !! in the ePBL TKE budget, following the integrated ePBL+MLE framework of
+                !! Sane et al. (in prep). Set by MOM_mixed_layer_restrat and consumed by
+                !! MOM_energetic_PBL, both gated by their own coupling switches
+                !! [Z3 T-3 ~> m3 s-3].
   real, pointer, dimension(:,:,:) :: Kd_shear => NULL()
                 !< The shear-driven turbulent diapycnal diffusivity at the interfaces between layers
                 !! in tracer columns [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
