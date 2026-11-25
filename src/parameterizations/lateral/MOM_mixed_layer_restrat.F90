@@ -795,10 +795,10 @@ real function mu_hat(sigma, sigma_bl, dh)
   real :: mu_at_bld ! The value of the unmodified mu(z) at the base of the boundary layer [nondim]
 
   if (sigma_bl >= 1.0) then
-    ! The boundary layer reaches at least as deep as the mixed layer, so the ePBL+MLE
-    ! integrated TKE budget already accounts for all of the restratification; see row 3 of
-    ! Table 1 in the manuscript.
-    mu_hat = 0.0
+    ! The boundary layer reaches at least as deep as the mixed layer. Restratification is
+    ! still active in this case, so use the unmodified MLE structure function rather than
+    ! switching the MLE transport off (previously mu_hat = 0.0 here).
+    mu_hat = mu(sigma, dh)
   elseif (sigma_bl <= 0.0) then
     ! No active boundary layer to speak of: fall back on the unmodified structure function.
     mu_hat = mu(sigma, dh)
@@ -1276,7 +1276,7 @@ subroutine mixedlayer_restrat_Bodner(CS, G, GV, US, h, uhtr, vhtr, tv, forces, d
   if (associated(MLE_Buoy_Flux)) then
     ! Average the face-point MLE buoyancy flux diagnostics onto tracer points for use by ePBL.
     do j=js,je ; do i=is,ie
-      MLE_Buoy_Flux(i,j) = 0.25 * ( (mle_wb_u(I-1,j) + mle_wb_u(I,j)) + &
+      MLE_Buoy_Flux(i,j) = 0.5 * ( (mle_wb_u(I-1,j) + mle_wb_u(I,j)) + &
                                      (mle_wb_v(i,J-1) + mle_wb_v(i,J)) )
     enddo ; enddo
   endif
